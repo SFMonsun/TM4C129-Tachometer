@@ -13,6 +13,7 @@ main.obj: C:/ti/ti-cgt-arm_18.12.2.LTS/include/stdio.h
 main.obj: C:/ti/ti-cgt-arm_18.12.2.LTS/include/_ti_config.h
 main.obj: C:/ti/ti-cgt-arm_18.12.2.LTS/include/linkage.h
 main.obj: C:/ti/ti-cgt-arm_18.12.2.LTS/include/stdarg.h
+main.obj: C:/ti/ti-cgt-arm_18.12.2.LTS/include/string.h
 main.obj: ../display/display.h
 main.obj: C:/ti/TivaWare_C_Series-2.2.0.295/driverlib/sysctl.h
 main.obj: C:/ti/ti-cgt-arm_18.12.2.LTS/include/stdbool.h
@@ -47,6 +48,8 @@ C:/ti/ti-cgt-arm_18.12.2.LTS/include/_ti_config.h:
 C:/ti/ti-cgt-arm_18.12.2.LTS/include/linkage.h:
 
 C:/ti/ti-cgt-arm_18.12.2.LTS/include/stdarg.h:
+
+C:/ti/ti-cgt-arm_18.12.2.LTS/include/string.h:
 
 ../display/display.h:
 
