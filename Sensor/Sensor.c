@@ -1,190 +1,489 @@
+/**
+ * Sensor.c - KMZ60 Speed and Direction Detection for TM4C1294NCPDT
+ * 
+ * CRITICAL FIX: Port P on TM4C1294 uses per-pin interrupts!
+ * - P0 has INT_GPIOP0
+ * - P1 has INT_GPIOP1
+ * 
+ * Based on the signal diagram:
+ * - S1 connected to Port P0 (comparator output)
+ * - S2 connected to Port P1 (comparator output)
+ * - Signals are 90° phase-shifted (quadrature)
+ * 
+ * Forward (Rechtslauf):  11 -> 01 -> 00 -> 10 -> 11
+ * Backward (Linkslauf):  11 -> 10 -> 00 -> 01 -> 11
+ */
+
 #include "Sensor.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <math.h>
+#include <stdbool.h>
 #include "inc/hw_memmap.h"
+#include "inc/hw_ints.h"
+#include "inc/hw_gpio.h"
+#include "inc/hw_types.h"
 #include "driverlib/sysctl.h"
 #include "driverlib/gpio.h"
-#include "driverlib/adc.h"
+#include "driverlib/interrupt.h"
+#include "driverlib/timer.h"
 
-// ADC pin mapping for TM4C1294
-// Actual connections: Vcos=E3(AIN0), Vsin=E2(AIN1), Vref=C7(AIN12)
-#define ADC_BASE        ADC0_BASE
-#define ADC_SEQUENCE    0  // Sequence 0 supports multiple steps
+/* ============== Pin Definitions ============== */
+#define S1_PORT         GPIO_PORTP_BASE
+#define S1_PIN          GPIO_PIN_0
+#define S2_PORT         GPIO_PORTP_BASE
+#define S2_PIN          GPIO_PIN_1
 
-#define ADC_VCOS_CH     ADC_CTL_CH0   // PE3, AIN0
-#define ADC_VSIN_CH     ADC_CTL_CH1   // PE2, AIN1
-#define ADC_VREF_CH     ADC_CTL_CH12  // PC7, AIN12
+/* Timer for measuring time between edges */
+#define EDGE_TIMER_BASE TIMER2_BASE
 
-#define ADC_MAX_VALUE   4095.0f
-#define VREF            3.3f
+/* 
+ * CRITICAL: TM4C1294 Port P uses PER-PIN interrupts!
+ * These values come from hw_ints.h - use the actual defines
+ */
+#ifndef INT_GPIOP0
+#define INT_GPIOP0      92   /* Actual value from TM4C1294 hw_ints.h */
+#endif
+#ifndef INT_GPIOP1
+#define INT_GPIOP1      93
+#endif
 
-// Wheel parameters
-#define WHEEL_RADIUS_M  0.03f   // 3 cm radius wheel
-#define DT              0.01f   // 10ms sampling interval (matches timer)
+/* Wheel parameters */
+#define WHEEL_RADIUS_M      0.005f      /* 0.5cm radius */
+#define WHEEL_CIRCUMFERENCE (2.0f * M_PI * WHEEL_RADIUS_M)
+#define TIMER_FREQ          120000000.0f   /* 120 MHz system clock as float */
 
-// Static variables for speed calculation using quadrature detection
-static float theta_prev = 0.0f;
-static int32_t cumulative_rotations = 0;  // Total rotations (can wrap around full circles)
-static uint8_t first_reading = 1;
+/* 
+ * Edges per rotation - using BOTH edges on S1 AND S2
+ * With quadrature: 4 edges per full rotation (2 on S1 + 2 on S2)
+ * If magnet has multiple poles, multiply accordingly
+ */
+#define EDGES_PER_ROTATION  4.0f
+
+/* Timeout: if no edge for this many timer ticks, motor is stopped */
+/* At 120MHz, 60000000 ticks = 0.5 second */
+#define STOPPED_TIMEOUT     60000000UL
+
+/* Minimum period to filter noise (10µs at 120MHz = 1200 ticks) */
+#define MIN_PERIOD          1200UL
+
+/* Minimum update interval for speed calculation (300ms = 36M ticks at 120MHz) */
+/* This ensures consistent measurement windows for stable readings */
+/* Using 300ms to get at least 3 display cycles at 100ms intervals */
+#define MIN_UPDATE_INTERVAL 36000000UL
+
+/* ============== Volatile Variables (shared with ISR) ============== */
+volatile static uint32_t last_edge_time = 0;
+volatile static uint32_t edge_period = 0;
+volatile static uint8_t  new_edge_detected = 0;
+volatile static uint8_t  last_state = 0;        /* Combined state: (S1<<1)|S2 */
+volatile static int32_t  direction_counter = 0; /* Accumulated direction votes */
+volatile static uint32_t edge_count = 0;        /* Total edges for distance */
+volatile static uint32_t interrupt_count = 0;   /* Debug counter */
+
+/* ============== Non-Volatile State ============== */
+static RotationDirection current_direction = DIR_STOPPED;
+static float current_speed_kmh = 0.0f;
+static float current_rpm = 0.0f;
 static float accumulated_distance = 0.0f;
+static uint32_t last_edge_count = 0;
+static uint32_t last_display_edge_count = 0;
+static uint32_t last_display_time = 0;
 
-// Moving average filter for speed smoothing
-#define FILTER_SIZE 5
-static float speed_buffer[FILTER_SIZE] = {0};
-static uint8_t filter_index = 0;
-static uint8_t filter_filled = 0;
+/* Moving average filter for speed and RPM smoothing
+ * Using smaller filter since we now have 300ms measurement windows */
+#define SPEED_FILTER_SIZE 3
+#define RPM_FILTER_SIZE 3
+static float speed_buffer[SPEED_FILTER_SIZE] = {0};
+static uint8_t speed_filter_index = 0;
+static uint8_t speed_filter_count = 0;
 
+static float rpm_buffer[RPM_FILTER_SIZE] = {0};
+static uint8_t rpm_filter_index = 0;
+static uint8_t rpm_filter_count = 0;
+
+/* Direction hysteresis - need multiple consistent readings */
+#define DIRECTION_THRESHOLD 5
+
+/* ============== Direction Lookup Table ============== */
+/*
+ * Quadrature state transitions:
+ * State = (S1 << 1) | S2
+ *   State 0 = 00 (both low)
+ *   State 1 = 01 (S2 high)
+ *   State 2 = 10 (S1 high)
+ *   State 3 = 11 (both high)
+ * 
+ * Forward sequence:  3 -> 1 -> 0 -> 2 -> 3  (11->01->00->10->11)
+ * Backward sequence: 3 -> 2 -> 0 -> 1 -> 3  (11->10->00->01->11)
+ * 
+ * Table[old_state][new_state] = direction (+1, -1, or 0 for invalid/same)
+ */
+static const int8_t DIRECTION_TABLE[4][4] = {
+    /*          to: 00  01  10  11  */
+    /* from 00 */  { 0, +1, -1,  0 },
+    /* from 01 */  {-1,  0,  0, +1 },
+    /* from 10 */  {+1,  0,  0, -1 },
+    /* from 11 */  { 0, -1, +1,  0 }
+};
+
+/* ============== Common Edge Handler ============== */
+static void HandleEdge(void)
+{
+    uint32_t current_time;
+    uint8_t current_state;
+    uint8_t s1, s2;
+    int8_t dir;
+    
+    /* Read timer IMMEDIATELY for accurate timing */
+    current_time = TimerValueGet(EDGE_TIMER_BASE, TIMER_A);
+    
+    /* Read both pin states */
+    s1 = GPIOPinRead(S1_PORT, S1_PIN) ? 1 : 0;
+    s2 = GPIOPinRead(S2_PORT, S2_PIN) ? 1 : 0;
+    current_state = (s1 << 1) | s2;
+    
+    /* Decode direction from state transition */
+    dir = DIRECTION_TABLE[last_state][current_state];
+    
+    /* Only process valid transitions (skip glitches where state didn't change) */
+    if (current_state != last_state) {
+        uint32_t period;
+        
+        /* Calculate period (timer counts DOWN on TM4C) */
+        if (last_edge_time >= current_time) {
+            period = last_edge_time - current_time;
+        } else {
+            /* Timer wrapped around */
+            period = (last_edge_time) + (0xFFFFFFFFUL - current_time) + 1;
+        }
+        
+        /* Sanity check: ignore very short periods (noise/bounce) */
+        if (period > MIN_PERIOD && period < STOPPED_TIMEOUT) {
+            edge_period = period;
+            new_edge_detected = 1;
+            edge_count++;
+            
+            /* Accumulate direction votes for hysteresis */
+            if (dir > 0) {
+                direction_counter++;
+                if (direction_counter > 100) direction_counter = 100; /* Clamp */
+            } else if (dir < 0) {
+                direction_counter--;
+                if (direction_counter < -100) direction_counter = -100;
+            }
+        }
+        
+        last_edge_time = current_time;
+        last_state = current_state;
+    }
+    
+    interrupt_count++;
+}
+
+/* ============== GPIO Port P Pin 0 ISR (S1) ============== */
+void GPIOP0_IRQHandler(void)
+{
+    /* Clear the interrupt */
+    GPIOIntClear(S1_PORT, S1_PIN);
+    
+    /* Process the edge */
+    HandleEdge();
+}
+
+/* ============== GPIO Port P Pin 1 ISR (S2) ============== */
+void GPIOP1_IRQHandler(void)
+{
+    /* Clear the interrupt */
+    GPIOIntClear(S2_PORT, S2_PIN);
+    
+    /* Process the edge */
+    HandleEdge();
+}
+
+/* ============== Initialization ============== */
 void Sensor_Init(void)
 {
-    // Enable ADC0, GPIOE (for E2, E3), and GPIOC (for C7)
-    SysCtlPeripheralEnable(SYSCTL_PERIPH_ADC0);
-    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOE);
-    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOC);
-
-    while(!SysCtlPeripheralReady(SYSCTL_PERIPH_ADC0)){}
-    while(!SysCtlPeripheralReady(SYSCTL_PERIPH_GPIOE)){}
-    while(!SysCtlPeripheralReady(SYSCTL_PERIPH_GPIOC)){}
-
-    // Configure pins: PE2 (Vsin), PE3 (Vcos), PC7 (Vref) as ADC
-    GPIOPinTypeADC(GPIO_PORTE_BASE, GPIO_PIN_2 | GPIO_PIN_3);
-    GPIOPinTypeADC(GPIO_PORTC_BASE, GPIO_PIN_7);
-
-    // Configure sequence 0 with 3 steps: Vcos, Vsin, Vref
-    ADCSequenceConfigure(ADC_BASE, ADC_SEQUENCE, ADC_TRIGGER_PROCESSOR, 0);
-    ADCSequenceStepConfigure(ADC_BASE, ADC_SEQUENCE, 0, ADC_VCOS_CH);
-    ADCSequenceStepConfigure(ADC_BASE, ADC_SEQUENCE, 1, ADC_VSIN_CH);
-    ADCSequenceStepConfigure(ADC_BASE, ADC_SEQUENCE, 2, ADC_VREF_CH | ADC_CTL_IE | ADC_CTL_END);
-    ADCSequenceEnable(ADC_BASE, ADC_SEQUENCE);
-    ADCIntClear(ADC_BASE, ADC_SEQUENCE);
+    /* Enable GPIO Port P */
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOP);
+    while(!SysCtlPeripheralReady(SYSCTL_PERIPH_GPIOP)) {}
     
-    // Initialize static variables
-    theta_prev = 0.0f;
-    cumulative_rotations = 0;
+    /* Configure P0 (S1) and P1 (S2) as inputs */
+    GPIOPinTypeGPIOInput(S1_PORT, S1_PIN | S2_PIN);
+    
+    /* Configure with weak pull-up (comparator outputs might be open-drain) */
+    GPIOPadConfigSet(S1_PORT, S1_PIN | S2_PIN, 
+                     GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU);
+    
+    /* Configure interrupts on BOTH edges for both pins */
+    GPIOIntTypeSet(S1_PORT, S1_PIN, GPIO_BOTH_EDGES);
+    GPIOIntTypeSet(S2_PORT, S2_PIN, GPIO_BOTH_EDGES);
+    
+    /* Clear any pending interrupts */
+    GPIOIntClear(S1_PORT, S1_PIN | S2_PIN);
+    
+    /* Enable GPIO interrupts for both pins */
+    GPIOIntEnable(S1_PORT, S1_PIN);
+    GPIOIntEnable(S2_PORT, S2_PIN);
+    
+    /* Register ISRs with NVIC - CRITICAL for TM4C1294! */
+    IntRegister(INT_GPIOP0, GPIOP0_IRQHandler);
+    IntRegister(INT_GPIOP1, GPIOP1_IRQHandler);
+    
+    /* Set interrupt priorities (0x00 = highest, 0xE0 = lowest) */
+    IntPrioritySet(INT_GPIOP0, 0x20);
+    IntPrioritySet(INT_GPIOP1, 0x20);
+    
+    /* Enable interrupts in NVIC */
+    IntEnable(INT_GPIOP0);
+    IntEnable(INT_GPIOP1);
+    
+    /* Enable Timer2 as free-running counter for time measurement */
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER2);
+    while(!SysCtlPeripheralReady(SYSCTL_PERIPH_TIMER2)) {}
+    
+    /* Configure as 32-bit periodic timer (counts down) */
+    TimerConfigure(EDGE_TIMER_BASE, TIMER_CFG_PERIODIC);
+    TimerLoadSet(EDGE_TIMER_BASE, TIMER_A, 0xFFFFFFFF);
+    TimerEnable(EDGE_TIMER_BASE, TIMER_A);
+    
+    /* Read initial state */
+    uint8_t s1 = GPIOPinRead(S1_PORT, S1_PIN) ? 1 : 0;
+    uint8_t s2 = GPIOPinRead(S2_PORT, S2_PIN) ? 1 : 0;
+    last_state = (s1 << 1) | s2;
+    last_edge_time = TimerValueGet(EDGE_TIMER_BASE, TIMER_A);
+    
+    /* Initialize variables */
+    edge_period = 0;
+    new_edge_detected = 0;
+    direction_counter = 0;
+    edge_count = 0;
+    last_edge_count = 0;
+    interrupt_count = 0;
+    current_speed_kmh = 0.0f;
     accumulated_distance = 0.0f;
-    first_reading = 1;
-    filter_index = 0;
-    filter_filled = 0;
+    current_direction = DIR_STOPPED;
     
-    // Clear speed filter buffer
-    for(int i = 0; i < FILTER_SIZE; i++) {
+    /* Initialize time-based calculation references */
+    last_display_edge_count = 0;
+    last_display_time = TimerValueGet(EDGE_TIMER_BASE, TIMER_A);
+    
+    /* Clear speed and RPM filters */
+    for (int i = 0; i < SPEED_FILTER_SIZE; i++) {
         speed_buffer[i] = 0.0f;
     }
+    speed_filter_index = 0;
+    speed_filter_count = 0;
+
+    for (int i = 0; i < RPM_FILTER_SIZE; i++) {
+        rpm_buffer[i] = 0.0f;
+    }
+    rpm_filter_index = 0;
+    rpm_filter_count = 0;
+    
+    printf("Sensor_Init complete\n");
+    printf("  S1 on P0, S2 on P1\n");
+    printf("  Initial state: S1=%d, S2=%d (combined=%d)\n", s1, s2, last_state);
+    printf("  Using per-pin interrupts: INT_GPIOP0=%d, INT_GPIOP1=%d\n", 
+           INT_GPIOP0, INT_GPIOP1);
+    printf("  Timer frequency: 120 MHz\n");
+    printf("  Edges per rotation: %.1f\n", EDGES_PER_ROTATION);
+    printf("  Wheel circumference: %.4f m\n", WHEEL_CIRCUMFERENCE);
 }
 
-float Sensor_ReadSpeed(void)
+/* ============== Get Speed (call from main loop) ============== */
+float Sensor_GetSpeed(void)
 {
-    uint32_t adcValues[3];
-    float vcos, vsin, vref;
-    float theta, delta_theta, v_mps, v_kmh;
-
-    // Oversample ADC: Take 4 readings and average them for noise reduction
-    float vcos_sum = 0, vsin_sum = 0, vref_sum = 0;
-    const int NUM_SAMPLES = 4;
+    static uint32_t call_count = 0;
+    static uint32_t last_int_count = 0;
+    uint32_t int_copy;
+    uint32_t edge_copy;
+    int32_t dir_copy;
+    uint32_t current_time;
     
-    for(int sample = 0; sample < NUM_SAMPLES; sample++) {
-        ADCProcessorTrigger(ADC_BASE, ADC_SEQUENCE);
-        while(!ADCIntStatus(ADC_BASE, ADC_SEQUENCE, false)){}
-        ADCSequenceDataGet(ADC_BASE, ADC_SEQUENCE, adcValues);
-        ADCIntClear(ADC_BASE, ADC_SEQUENCE);
-
-        vcos_sum += ((float)adcValues[0] / ADC_MAX_VALUE) * VREF;
-        vsin_sum += ((float)adcValues[1] / ADC_MAX_VALUE) * VREF;
-        vref_sum += ((float)adcValues[2] / ADC_MAX_VALUE) * VREF;
+    /* Get current timer value for time-based calculation */
+    current_time = TimerValueGet(EDGE_TIMER_BASE, TIMER_A);
+    
+    /* Atomic read of volatile variables */
+    IntMasterDisable();
+    int_copy = interrupt_count;
+    edge_copy = edge_count;
+    dir_copy = direction_counter;
+    IntMasterEnable();
+    
+    /* Debug output every ~500 calls */
+    call_count++;
+    if (call_count >= 500) {
+        uint8_t s1 = GPIOPinRead(S1_PORT, S1_PIN) ? 1 : 0;
+        uint8_t s2 = GPIOPinRead(S2_PORT, S2_PIN) ? 1 : 0;
+        printf("[DBG] Int:%lu Edges:%lu DirCnt:%ld S1=%d S2=%d\n",
+               (unsigned long)int_copy, 
+               (unsigned long)edge_copy,
+               (long)dir_copy,
+               s1, s2);
+        last_int_count = int_copy;
+        call_count = 0;
     }
     
-    vcos = vcos_sum / NUM_SAMPLES;
-    vsin = vsin_sum / NUM_SAMPLES;
-    vref = vref_sum / NUM_SAMPLES;
-
-    // Use FIXED center voltage - ignore varying Vref for now
-    const float CENTER = 1.65f;
-    float vcos_centered = vcos - CENTER;
-    float vsin_centered = vsin - CENTER;
+    /*
+     * NEW APPROACH: Calculate speed from edge count over time interval
+     * This is more reliable than single-edge period measurement
+     * 
+     * Speed = (edges_delta / EDGES_PER_ROTATION) * WHEEL_CIRCUMFERENCE / time_delta
+     */
     
-    // Calculate signal magnitude
-    float magnitude = sqrtf(vcos_centered * vcos_centered + vsin_centered * vsin_centered);
+    /* Calculate edges since last display update */
+    uint32_t edges_delta = edge_copy - last_display_edge_count;
     
-    // Debug output every 100 readings
-    static uint32_t debug_counter = 0;
-    if(++debug_counter >= 100) {
-        printf("ADC: Vcos=%.3fV Vsin=%.3fV Vref=%.3fV Mag=%.3fV | Rotations=%ld\n", 
-               vcos, vsin, vref, magnitude, cumulative_rotations);
-        debug_counter = 0;
-    }
-
-    // If signal is too weak, return 0
-    if(magnitude < 0.1f) {
-        return 0.0f;
-    }
-
-    // Calculate angle using atan2
-    theta = atan2f(vsin_centered, vcos_centered);
-
-    // First reading initialization
-    if(first_reading) {
-        theta_prev = theta;
-        first_reading = 0;
-        return 0.0f;
-    }
-
-    // Calculate angle change with proper wrapping handling
-    delta_theta = theta - theta_prev;
-    
-    // Handle wrapping: adjust for shortest path
-    if(delta_theta > M_PI) {
-        delta_theta -= 2.0f * M_PI;
-    } else if(delta_theta < -M_PI) {
-        delta_theta += 2.0f * M_PI;
+    /* Calculate time since last display (timer counts DOWN) */
+    uint32_t time_delta;
+    if (last_display_time >= current_time) {
+        time_delta = last_display_time - current_time;
+    } else {
+        time_delta = last_display_time + (0xFFFFFFFFUL - current_time) + 1;
     }
     
-    theta_prev = theta;
+    /* Only update if enough time has passed for accurate measurement (at least 200ms) */
+    if (time_delta >= MIN_UPDATE_INTERVAL && edges_delta > 0) {
+        /* Calculate time in seconds */
+        float time_seconds = (float)time_delta / TIMER_FREQ;
 
-    // Accumulate total rotation (this handles multiple rotations correctly)
-    // Note: We're measuring angle change per sample, which works even if
-    // multiple rotations occur, because we track the continuous phase
-    float omega = delta_theta / DT;  // rad/s
-    
-    // Linear speed
-    v_mps = fabsf(omega * WHEEL_RADIUS_M);
-    
-    // Update cumulative rotations for display
-    cumulative_rotations += (int32_t)(delta_theta / (2.0f * M_PI));
-    
-    // Accumulate distance
-    accumulated_distance += v_mps * DT;
-    
-    // Convert to km/h
-    v_kmh = v_mps * 3.6f;
-    
-    // Apply moving average filter
-    speed_buffer[filter_index] = v_kmh;
-    filter_index = (filter_index + 1) % FILTER_SIZE;
-    if(!filter_filled && filter_index == 0) {
-        filter_filled = 1;
-    }
-    
-    float speed_sum = 0.0f;
-    int count = filter_filled ? FILTER_SIZE : filter_index;
-    for(int i = 0; i < count; i++) {
-        speed_sum += speed_buffer[i];
-    }
-    float filtered_speed = (count > 0) ? (speed_sum / count) : 0.0f;
-    
-    // Dead zone
-    if(filtered_speed < 0.5f) {
-        filtered_speed = 0.0f;
-    }
+        /* Calculate rotations */
+        float rotations = (float)edges_delta / EDGES_PER_ROTATION;
 
-    return filtered_speed;
+        /* Calculate RPM: (rotations / time) * 60 */
+        float rpm = (rotations / time_seconds) * 60.0f;
+
+        /* Debug: Print calculation details occasionally */
+        static uint32_t calc_count = 0;
+        calc_count++;
+        if (calc_count % 5 == 0) {
+            printf("[CALC] Edges=%lu TimeMs=%.1f RPM=%.1f\n",
+                   (unsigned long)edges_delta,
+                   time_seconds * 1000.0f,
+                   rpm);
+        }
+
+        /* Calculate speed: rotations * circumference / time = m/s */
+        float velocity_mps = (rotations * WHEEL_CIRCUMFERENCE) / time_seconds;
+
+        /* Convert to km/h */
+        float velocity_kmh = velocity_mps * 3.6f;
+        
+        /* Sanity check for speed */
+        if (velocity_kmh > 200.0f) {
+            velocity_kmh = current_speed_kmh; /* Keep previous value */
+        } else if (velocity_kmh < 0.0f) {
+            velocity_kmh = 0.0f;
+        }
+
+        /* Sanity check for RPM (max 19000 RPM) */
+        if (rpm > 20000.0f) {
+            rpm = current_rpm; /* Keep previous value */
+        } else if (rpm < 0.0f) {
+            rpm = 0.0f;
+        }
+
+        /* Apply moving average filter to speed */
+        speed_buffer[speed_filter_index] = velocity_kmh;
+        speed_filter_index = (speed_filter_index + 1) % SPEED_FILTER_SIZE;
+        if (speed_filter_count < SPEED_FILTER_SIZE) {
+            speed_filter_count++;
+        }
+
+        /* Calculate average speed */
+        float speed_sum = 0.0f;
+        for (int i = 0; i < speed_filter_count; i++) {
+            speed_sum += speed_buffer[i];
+        }
+        current_speed_kmh = speed_sum / (float)speed_filter_count;
+
+        /* Apply moving average filter to RPM */
+        rpm_buffer[rpm_filter_index] = rpm;
+        rpm_filter_index = (rpm_filter_index + 1) % RPM_FILTER_SIZE;
+        if (rpm_filter_count < RPM_FILTER_SIZE) {
+            rpm_filter_count++;
+        }
+
+        /* Calculate average RPM - this is the smoothed value shown in display */
+        float rpm_sum = 0.0f;
+        for (int i = 0; i < rpm_filter_count; i++) {
+            rpm_sum += rpm_buffer[i];
+        }
+        current_rpm = rpm_sum / (float)rpm_filter_count;
+        
+        /* Update direction with hysteresis */
+        if (dir_copy > DIRECTION_THRESHOLD) {
+            current_direction = DIR_FORWARD;
+        } else if (dir_copy < -DIRECTION_THRESHOLD) {
+            current_direction = DIR_REVERSE;
+        }
+        /* Otherwise keep current direction (hysteresis) */
+        
+        /* Update distance */
+        accumulated_distance += rotations * WHEEL_CIRCUMFERENCE;
+        
+        /* Reset counters for next interval */
+        last_display_edge_count = edge_copy;
+        last_display_time = current_time;
+        
+    } else if (time_delta > STOPPED_TIMEOUT) {
+        /* No edges for too long - motor stopped */
+        current_speed_kmh = 0.0f;
+        current_rpm = 0.0f;
+        current_direction = DIR_STOPPED;
+
+        /* Clear speed and RPM filters */
+        for (int i = 0; i < SPEED_FILTER_SIZE; i++) {
+            speed_buffer[i] = 0.0f;
+        }
+        speed_filter_count = 0;
+
+        for (int i = 0; i < RPM_FILTER_SIZE; i++) {
+            rpm_buffer[i] = 0.0f;
+        }
+        rpm_filter_count = 0;
+
+        /* Reset reference point */
+        last_display_edge_count = edge_copy;
+        last_display_time = current_time;
+    }
+    
+    return current_speed_kmh;
 }
 
+/* ============== Get Direction ============== */
+RotationDirection Sensor_GetDirection(void)
+{
+    return current_direction;
+}
+
+/* ============== Get Distance ============== */
+float Sensor_GetDistance(void)
+{
+    return accumulated_distance;
+}
+
+/* ============== Reset Distance ============== */
 void Sensor_ResetDistance(void)
 {
     accumulated_distance = 0.0f;
 }
 
-float Sensor_GetDistance(void)
+/* ============== Debug: Get Raw Interrupt Count ============== */
+uint32_t Sensor_GetInterruptCount(void)
 {
-    return accumulated_distance;
+    return interrupt_count;
+}
+
+/* ============== Debug: Get Edge Count ============== */
+uint32_t Sensor_GetEdgeCount(void)
+{
+    return edge_count;
+}
+
+/* ============== Get RPM ============== */
+float Sensor_GetRPM(void)
+{
+    return current_rpm;
 }
