@@ -33,6 +33,9 @@ uint8_t startUp = 1;
 /* Counter for RPM display update (slower than bars) */
 uint32_t rpmDisplayCounter = 0;
 
+/* Counter for odometer update (1 Hz = once per second) */
+uint32_t odoDisplayCounter = 0;
+
 /* Last direction for change detection */
 uint8_t lastDirection = 1;  // Start with forward (D)
 
@@ -189,8 +192,14 @@ int main(void)
                 rpmDisplayCounter = 0;
                 UpdateRPMDisplay(rpm_int);
 
-                /* Also update KMH and ODO displays at same rate */
+                /* Update KMH display at same rate as RPM */
                 UpdateKMHDisplay(kmh_int);
+            }
+
+            /* Update ODO display every 1s (10 * 100ms = 1000ms) */
+            odoDisplayCounter++;
+            if (odoDisplayCounter >= 10) {
+                odoDisplayCounter = 0;
                 UpdateODODisplay(odo_decimeters);
             }
 
