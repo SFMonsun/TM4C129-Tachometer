@@ -67,10 +67,10 @@
 /* Minimum period to filter noise (10µs at 120MHz = 1200 ticks) */
 #define MIN_PERIOD          1200UL
 
-/* Minimum update interval for speed calculation (300ms = 36M ticks at 120MHz) */
+/* Minimum update interval for speed calculation (100ms = 12M ticks at 120MHz) */
 /* This ensures consistent measurement windows for stable readings */
-/* Using 300ms to get at least 3 display cycles at 100ms intervals */
-#define MIN_UPDATE_INTERVAL 36000000UL
+/* Using 100ms to match display update rate for responsive updates */
+#define MIN_UPDATE_INTERVAL 12000000UL
 
 /* ============== Volatile Variables (shared with ISR) ============== */
 volatile static uint32_t last_edge_time = 0;
@@ -230,9 +230,10 @@ void Sensor_Init(void)
     IntRegister(INT_GPIOP0, GPIOP0_IRQHandler);
     IntRegister(INT_GPIOP1, GPIOP1_IRQHandler);
     
-    /* Set interrupt priorities (0x00 = highest, 0xE0 = lowest) */
-    IntPrioritySet(INT_GPIOP0, 0x20);
-    IntPrioritySet(INT_GPIOP1, 0x20);
+    /* Set interrupt priorities to HIGHEST (0x00 = highest, 0xE0 = lowest) */
+    /* CRITICAL: Sensor timing is most important - must not be delayed */
+    IntPrioritySet(INT_GPIOP0, 0x00);
+    IntPrioritySet(INT_GPIOP1, 0x00);
     
     /* Enable interrupts in NVIC */
     IntEnable(INT_GPIOP0);
@@ -281,14 +282,14 @@ void Sensor_Init(void)
     rpm_filter_index = 0;
     rpm_filter_count = 0;
     
-    printf("Sensor_Init complete\n");
-    printf("  S1 on P0, S2 on P1\n");
-    printf("  Initial state: S1=%d, S2=%d (combined=%d)\n", s1, s2, last_state);
-    printf("  Using per-pin interrupts: INT_GPIOP0=%d, INT_GPIOP1=%d\n", 
-           INT_GPIOP0, INT_GPIOP1);
-    printf("  Timer frequency: 120 MHz\n");
-    printf("  Edges per rotation: %.1f\n", EDGES_PER_ROTATION);
-    printf("  Wheel circumference: %.4f m\n", WHEEL_CIRCUMFERENCE);
+    //printf("Sensor_Init complete\n");
+   // printf("  S1 on P0, S2 on P1\n");
+   // printf("  Initial state: S1=%d, S2=%d (combined=%d)\n", s1, s2, last_state);
+   // printf("  Using per-pin interrupts: INT_GPIOP0=%d, INT_GPIOP1=%d\n", 
+        //   INT_GPIOP0, INT_GPIOP1);
+   // printf("  Timer frequency: 120 MHz\n");
+   // printf("  Edges per rotation: %.1f\n", EDGES_PER_ROTATION);
+   // printf("  Wheel circumference: %.4f m\n", WHEEL_CIRCUMFERENCE);
 }
 
 /* ============== Get Speed (call from main loop) ============== */
@@ -316,11 +317,11 @@ float Sensor_GetSpeed(void)
     if (call_count >= 500) {
         uint8_t s1 = GPIOPinRead(S1_PORT, S1_PIN) ? 1 : 0;
         uint8_t s2 = GPIOPinRead(S2_PORT, S2_PIN) ? 1 : 0;
-        printf("[DBG] Int:%lu Edges:%lu DirCnt:%ld S1=%d S2=%d\n",
-               (unsigned long)int_copy, 
-               (unsigned long)edge_copy,
-               (long)dir_copy,
-               s1, s2);
+       // printf("[DBG] Int:%lu Edges:%lu DirCnt:%ld S1=%d S2=%d\n",
+       //        (unsigned long)int_copy, 
+       //       (unsigned long)edge_copy,
+       //        (long)dir_copy,
+       //       s1, s2);
         last_int_count = int_copy;
         call_count = 0;
     }
@@ -343,7 +344,7 @@ float Sensor_GetSpeed(void)
         time_delta = last_display_time + (0xFFFFFFFFUL - current_time) + 1;
     }
     
-    /* Only update if enough time has passed for accurate measurement (at least 200ms) */
+    /* Only update if enough time has passed for accurate measurement (at least 100ms) */
     if (time_delta >= MIN_UPDATE_INTERVAL && edges_delta > 0) {
         /* Calculate time in seconds */
         float time_seconds = (float)time_delta / TIMER_FREQ;
@@ -357,13 +358,14 @@ float Sensor_GetSpeed(void)
         /* Debug: Print calculation details occasionally */
         static uint32_t calc_count = 0;
         calc_count++;
+        /*
         if (calc_count % 5 == 0) {
             printf("[CALC] Edges=%lu TimeMs=%.1f RPM=%.1f\n",
                    (unsigned long)edges_delta,
                    time_seconds * 1000.0f,
                    rpm);
         }
-
+        */
         /* Calculate speed: rotations * circumference / time = m/s */
         float velocity_mps = (rotations * WHEEL_CIRCUMFERENCE) / time_seconds;
 
@@ -377,9 +379,9 @@ float Sensor_GetSpeed(void)
             velocity_kmh = 0.0f;
         }
 
-        /* Sanity check for RPM (max 19000 RPM) */
-        if (rpm > 20000.0f) {
-            rpm = current_rpm; /* Keep previous value */
+        /* Sanity check for RPM - allow values above 20k up to display max */
+        if (rpm > 99999.0f) {
+            rpm = 99999.0f; /* Clamp to display maximum (5 digits) */
         } else if (rpm < 0.0f) {
             rpm = 0.0f;
         }
